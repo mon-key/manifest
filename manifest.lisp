@@ -2,12 +2,10 @@
 
 (defvar *manifest-server* nil)
 
-(defparameter *inverting-readtable*
-    (let ((rt (copy-readtable nil)))
-      (setf (readtable-case rt) :invert)
-      rt))
-
 (defparameter *categories* '(:function :generic-function :slot-accessor :variable :class :condition :constant))
+
+(defparameter *including-internals* nil
+  "When set non-nil manifest will also display a packages documented internal features.")
 
 (defun start (&key (port 0))
   "Start the manifest server and return the URL to browse. By default
@@ -27,32 +25,25 @@ keyword argument."
   "Stop the manifest server, defaulting to *manifest-server*."
   (stop-acceptor server))
 
-(defun case-invert-name (name)
-  "Invert case of names so we can use nice lowercase names in URLs in
-a true Common Lisp while still working in Allegro's mlisp."
-  (let ((*readtable* *inverting-readtable*)
-        (*package* (find-package :keyword)))
-    (symbol-name (read-from-string name))))
-
 (defun make-handler (&optional (root-dir (asdf:system-relative-pathname :manifest nil)))
   (let ((static-files (make-instance 'static-file-handler :root root-dir)))
     (lambda (request)
-      (let ((result (manifest request)))
+      (let ((result (manifest request :including-internals *including-internals*)))
         (case result
           (not-handled (handle-request static-files request))
           (t result))))))
 
-(defun manifest (request)
+(defun manifest (request &key (including-internals *including-internals*))
   (cond
     ((string= (request-path request) "/") (index-page request))
-    (t (package-page request))))
+    (t (package-page request :including-internals including-internals))))
 
-(defun package-page (request)
+(defun package-page (request &key (including-internals *including-internals*))
   (destructuring-bind (package-name &rest rest)
       (split-sequence #\/ (subseq (request-path request) 1))
     (declare (ignore rest))
 
-    (let ((package (find-package (case-invert-name package-name)))
+    (let ((package (find-package (string-upcase package-name)))
           (some-docs-p nil))
       (cond
         (package
@@ -81,18 +72,21 @@ a true Common Lisp while still working in Allegro's mlisp."
                    (html (:pre readme))))
 
                (loop for what in *categories*
-                  for names = (names package what)
+                  for names = (names package what :including-internals including-internals)
                   when names do
-                    (setf some-docs-p t)
-                    (html
-                      (:h2 (:format "~:(~a~)" (pluralization what)))
-                      (:table
-                       (dolist (sym names)
-                         (html
-                           (:tr
-                            (:td :class "symbol" (:print (princ-to-string sym)))
-                            (:td :class "docs" (:print (or (docs-for sym what) "NO DOCS!")))))))))
-
+                  (setf some-docs-p t)
+                  (html
+                    (:h2 (:format "~:(~a~)" (pluralization what)))
+                    (:table
+                     (dolist (sym names)
+                       (html
+                         (:tr
+                          (:td :class "symbol" (:print (string-downcase (princ-to-string sym))))
+                          ;; :WAS (:td :class "docs" (:print (or (docs-for sym what) "NO DOCS!")))))))))
+                          ;; :NOTE niether :samp nor :code will change the output
+                          ;; (:td :class "docs" (:samp (:print (or (docs-for sym what) "NO DOCS!"))))))))))
+                          ;; (:td :class "docs" (:code (:print (or (docs-for sym what) "NO DOCS!"))))))))))
+                          (:td :class "docs" (:pre (:print (or (docs-for sym what) "NO DOCS!"))))))))))
 
                (let ((used-by (sort (package-used-by-list package) #'string< :key #'package-name)))
                  (when used-by
@@ -102,7 +96,7 @@ a true Common Lisp while still working in Allegro's mlisp."
                       (loop for p in used-by do
                            (html (:li ((:a :href (:format "./~(~a~)" (package-name p)))
                                        (:print (package-name p))))))))))
-
+               
                (let ((uses (sort (package-use-list package) #'string< :key #'package-name)))
                  (when uses
                    (html
@@ -128,7 +122,7 @@ a true Common Lisp while still working in Allegro's mlisp."
          (:h1 "All Packages")
          (:ul
           (loop for pkg in (sort (mapcar #'package-name (public-packages)) #'string<)
-             do (html (:li (:a :class "package" :href (:format "./~a" (case-invert-name pkg)) pkg))))))))))
+             do (html (:li (:a :href (:format "./~a" (string-downcase pkg)) pkg))))))))))
 
 (defun public-packages ()
   (loop for p in (list-all-packages)
@@ -141,22 +135,20 @@ a true Common Lisp while still working in Allegro's mlisp."
     (return-from has-exported-symbols-p t))
   nil)
 
-(defun needs-documentation (package)
+(defun needs-documentation (package &key (including-internals *including-internals*))
   (loop for what in *categories*
-     for names = (names package what)
+     for names = (names package what :including-internals including-internals)
      when names nconc
        (loop for sym in names unless (docs-for sym what) collect (list sym what))))
 
-(defun documentation-templates (package)
-  (loop for (name what) in (needs-documentation package)
+(defun documentation-templates (package &key (including-internals *including-internals*))
+  (loop for (name what) in (needs-documentation package :including-internals including-internals)
        collect
        (ecase what
          (:slot-accessor
           `(setf (documentation #',name t) "WRITE ME!"))
          (:class
           `(setf (documentation (find-class ',name) t) "WRITE ME!")))))
-
-
 
 (defun readme-text (package-name)
   (let ((dir (ignore-errors (asdf:system-relative-pathname package-name nil))))
@@ -167,11 +159,41 @@ a true Common Lisp while still working in Allegro's mlisp."
             (loop for line = (read-line in nil nil)
                while line do (write-line line s))))))))
 
-(defun names (package what)
+;; (internal-symbol-p 'CL-PPCRE::TRY-NUMBER (find-package "CL-PPCRE"))
+;; (internal-symbol-p 'CL-PPCRE::DEFUN (find-package "CL-PPCRE"))
+(defun internal-symbol-p (symbol package)
+  (declare (symbol symbol)
+           (package package))
+  (eq package (symbol-package symbol)))
+
+;; A version of manifest::names with keyword INCLUDING-INTERNALS
+;; When INCLUDING-INTERNALS is non-nil return value includes _documented_
+;; internal WHATs of PACKAGE.
+;; EXAMPLE
+;; (length (tt--names (find-package "CL-PPCRE") :function))
+;; (length (tt--names (find-package "CL-PPCRE") :function :including-internals t))
+;; http://paste.lisp.org/+2PJA
+(defun names (package what &key (including-internals *including-internals*))
   (sort
-   (loop for sym being the external-symbols of package
-      when (is sym what) collect sym
-      when (is `(setf ,sym) what) collect `(setf ,sym))
+   (if including-internals 
+       (loop
+          for int-or-ext-sym being the present-symbols of package
+          for internal-check = (and (internal-symbol-p int-or-ext-sym package)
+                                    (nth-value 1 (find-symbol (symbol-name int-or-ext-sym) package)))
+          if internal-check
+           if (eql :external internal-check)
+            when (is int-or-ext-sym what) collect int-or-ext-sym
+            else
+            when (is `(setf ,int-or-ext-sym) what) collect `(setf ,int-or-ext-sym)
+           end
+          ;;else
+          when (and (is int-or-ext-sym what) (docs-for int-or-ext-sym what)) collect int-or-ext-sym
+          when (and (is `(setf ,int-or-ext-sym) what)
+                    (docs-for `(setf ,int-or-ext-sym) what)) collect `(setf ,int-or-ext-sym))
+       (loop
+          for sym being the external-symbols of package
+          when (is sym what) collect sym
+          when (is `(setf ,sym) what) collect `(setf ,sym)))
    #'name<))
 
 (defun name< (n1 n2)
