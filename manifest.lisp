@@ -2,6 +2,11 @@
 
 (defvar *manifest-server* nil)
 
+(defparameter *inverting-readtable*
+    (let ((rt (copy-readtable nil)))
+      (setf (readtable-case rt) :invert)
+      rt))
+
 (defparameter *categories* '(:function :generic-function :slot-accessor :variable :class :condition :constant))
 
 (defparameter *including-internals* nil
@@ -25,10 +30,18 @@ keyword argument."
   "Stop the manifest server, defaulting to *manifest-server*."
   (stop-acceptor server))
 
+(defun case-invert-name (name)
+  "Invert case of names so we can use nice lowercase names in URLs in
+a true Common Lisp while still working in Allegro's mlisp."
+  (let ((*readtable* *inverting-readtable*)
+        (*package* (find-package :keyword)))
+    (symbol-name (read-from-string name))))
+
 (defun make-handler (&optional (root-dir (asdf:system-relative-pathname :manifest nil)))
   (let ((static-files (make-instance 'static-file-handler :root root-dir)))
     (lambda (request)
-      (let ((result (manifest request :including-internals *including-internals*)))
+      (let ((*default-pathname-defaults* root-dir)
+            (result (manifest request :including-internals *including-internals*)))
         (case result
           (not-handled (handle-request static-files request))
           (t result))))))
@@ -36,14 +49,18 @@ keyword argument."
 (defun manifest (request &key (including-internals *including-internals*))
   (cond
     ((string= (request-path request) "/") (index-page request))
-    (t (package-page request :including-internals including-internals))))
+    ((string= (request-path request) "/quicklisp") (quicklisp-page request))
+    ((starts-with-subseq "/quicklisp/install/" (request-path request)) (quicklisp-install request))
+    ((starts-with-subseq "/package/" (request-path request)) (package-page request :including-internals including-internals))
+    (t 'not-handled)))
 
 (defun package-page (request &key (including-internals *including-internals*))
-  (destructuring-bind (package-name &rest rest)
+  (destructuring-bind (prefix package-name &rest rest)
       (split-sequence #\/ (subseq (request-path request) 1))
     (declare (ignore rest))
+    (assert (string= prefix "package"))
 
-    (let ((package (find-package (string-upcase package-name)))
+    (let ((package (find-package (case-invert-name package-name)))
           (some-docs-p nil))
       (cond
         (package
@@ -52,7 +69,7 @@ keyword argument."
              (:html
                (:head
                 (:title (:format "Package: ~a" (package-name package)))
-                (:link :rel "stylesheet" :type "text/css" :href "manifest.css"))
+                (:link :rel "stylesheet" :type "text/css" :href "/manifest.css"))
 
                (:body
                 (:h1 (:print (package-name package))))
@@ -74,19 +91,16 @@ keyword argument."
                (loop for what in *categories*
                   for names = (names package what :including-internals including-internals)
                   when names do
-                  (setf some-docs-p t)
-                  (html
-                    (:h2 (:format "~:(~a~)" (pluralization what)))
-                    (:table
-                     (dolist (sym names)
-                       (html
-                         (:tr
-                          (:td :class "symbol" (:print (string-downcase (princ-to-string sym))))
-                          ;; :WAS (:td :class "docs" (:print (or (docs-for sym what) "NO DOCS!")))))))))
-                          ;; :NOTE niether :samp nor :code will change the output
-                          ;; (:td :class "docs" (:samp (:print (or (docs-for sym what) "NO DOCS!"))))))))))
-                          ;; (:td :class "docs" (:code (:print (or (docs-for sym what) "NO DOCS!"))))))))))
-                          (:td :class "docs" (:pre (:print (or (docs-for sym what) "NO DOCS!"))))))))))
+                    (setf some-docs-p t)
+                    (html
+                      (:h2 (:format "~:(~a~)" (pluralization what)))
+                      (:table
+                       (dolist (sym names)
+                         (html
+                           ((:tr :class (:format "~:[not-documented~;~]" (docs-for sym what)))
+                            (:td :class "symbol" (:print (princ-to-string sym)))
+                            (:td :class "docs" (:pre (:print (or (docs-for sym what) "NO DOCS!"))))))))))
+
 
                (let ((used-by (sort (package-used-by-list package) #'string< :key #'package-name)))
                  (when used-by
@@ -117,12 +131,85 @@ keyword argument."
       (:html
         (:head
          (:title "Manifest: all packages")
-         (:link :rel "stylesheet" :type "text/css" :href "manifest.css"))
+         (:link :rel "stylesheet" :type "text/css" :href "/manifest.css"))
         (:body
          (:h1 "All Packages")
-         (:ul
+         ((:ul :class "packages")
           (loop for pkg in (sort (mapcar #'package-name (public-packages)) #'string<)
-             do (html (:li (:a :href (:format "./~a" (string-downcase pkg)) pkg))))))))))
+             do (html (:li (:a :class "package" :href (:format "/package/~a" (case-invert-name pkg)) pkg))))))))))
+
+(defun system-descriptions ()
+  "Temporary hack until Xach provides a way to get this programatically from Quicklisp."
+  (let ((h (make-hash-table :test #'equal)))
+    (with-open-file (in "descriptions.txt")
+      (loop for line = (read-line in nil nil)
+         while line do
+           (let* ((pos (search " - " line))
+                  (name (subseq line 0 pos))
+                  (description (subseq line (+ pos 3))))
+             (setf (gethash name h) description))))
+    h))
+
+(defun quicklisp-page (request)
+  (let ((descriptions (system-descriptions)))
+    (with-text-output ((send-headers request))
+      (html
+        (:html
+          (:head
+           (:title "Manifest: Quicklisp browser")
+           (:link :rel "stylesheet" :type "text/css" :href "manifest.css"))
+          (:body
+           (:h1 "Dists")
+           (loop for dist in (ql-dist:all-dists) do
+                (html
+                  (:h2 (:print (ql-dist:name dist)))
+                  (:table
+                   (:thead
+                    (:th "System")
+                    (:th "Description")
+                    (:th "Installed?"))
+                   (:tbody
+                    (loop for system in (ql-dist:provided-systems dist)
+                       for name = (ql-dist:name system)
+                       for installedp = (ql-dist:installedp system)
+                       for description = (gethash name descriptions "NO DESCRIPTION!")
+                       do
+                         (html
+                           (:tr
+                            (:td name)
+                            (:td description)
+                            (:td
+                             (if installedp
+                                 (html "✓")
+                                 (html (:a :href (:format "/quicklisp/install/~a" name) "Install")))))))))))))))))
+
+(defun foo ()
+  (let ((dist (ql-dist:find-dist "quicklisp"))
+        (systems (make-hash-table))
+        (in (make-hash-table))
+        (out (make-hash-table))
+        (all (make-hash-table)))
+    (flet ((record-dependency (system dep)
+             (setf (gethash system all) t)
+             (setf (gethash dep all) t)
+             (incf (gethash system out 0))
+             (incf (gethash dep in 0))))
+      (loop for release in (ql-dist:provided-releases dist) do
+         (loop for system in (ql-dist:provided-systems release) do
+              (loop for dep in (ql-dist:required-systems system) do
+                   (format t "~&~a requires ~a" (ql-dist:name system) dep)))))))
+
+
+
+(defun quicklisp-install (request)
+  (destructuring-bind (quicklisp install system &rest rest)
+      (split-sequence #\/ (subseq (request-path request) 1))
+    (declare (ignore rest))
+    (assert (string= quicklisp "quicklisp"))
+    (assert (string= install "install"))
+
+    (ql:quickload system)
+    (redirect request "/quicklisp")))
 
 (defun public-packages ()
   (loop for p in (list-all-packages)
